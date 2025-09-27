@@ -157,3 +157,134 @@ async init() {
     }
   );
 }
+import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+// Define our MCP agent with tools
+export class MyMCP extends McpAgent {
+  server = new McpServer({
+    name: "Authless Calculator",
+    version: "1.0.0",
+  });
+
+  async init() {
+    // ====== 已有演示工具（保留） ======
+    this.server.tool("add", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
+      content: [{ type: "text", text: String(a + b) }],
+    }));
+
+    this.server.tool(
+      "calculate",
+      {
+        operation: z.enum(["add", "subtract", "multiply", "divide"]),
+        a: z.number(),
+        b: z.number(),
+      },
+      async ({ operation, a, b }) => {
+        let result: number;
+        switch (operation) {
+          case "add": result = a + b; break;
+          case "subtract": result = a - b; break;
+          case "multiply": result = a * b; break;
+          case "divide":
+            if (b === 0) return { content: [{ type: "text", text: "Error: Cannot divide by zero" }] };
+            result = a / b; break;
+        }
+        return { content: [{ type: "text", text: String(result) }] };
+      },
+    );
+
+    // ====== 新增：Airtable 工具 ======
+    const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY!; // 面板 Secrets 已配置这个名字
+    const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID!; // 需要在面板 Variables 里新增
+    const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE!;     // 需要在面板 Variables 里新增
+
+    const airtableFetch = async (path: string, init?: RequestInit) => {
+      return fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${path}`, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${AIRTABLE_API_KEY}`,
+          "Content-Type": "application/json",
+          ...(init?.headers || {}),
+        },
+      });
+    };
+
+    // list
+    this.server.tool(
+      "airtable-list",
+      { maxRecords: z.number().optional(), view: z.string().optional() },
+      async ({ maxRecords = 5, view }) => {
+        const qs = new URLSearchParams();
+        qs.set("maxRecords", String(maxRecords));
+        if (view) qs.set("view", view);
+        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}?${qs.toString()}`);
+        return { content: [{ type: "json", json: await r.json() }] };
+      }
+    );
+
+    // get
+    this.server.tool(
+      "airtable-get",
+      { id: z.string() },
+      async ({ id }) => {
+        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}/${id}`);
+        return { content: [{ type: "json", json: await r.json() }] };
+      }
+    );
+
+    // create
+    this.server.tool(
+      "airtable-create",
+      { fields: z.record(z.any()) },
+      async ({ fields }) => {
+        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}`, {
+          method: "POST",
+          body: JSON.stringify({ fields }),
+        });
+        return { content: [{ type: "json", json: await r.json() }] };
+      }
+    );
+
+    // update
+    this.server.tool(
+      "airtable-update",
+      { id: z.string(), fields: z.record(z.any()) },
+      async ({ id, fields }) => {
+        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}/${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ fields }),
+        });
+        return { content: [{ type: "json", json: await r.json() }] };
+      }
+    );
+  }
+}
+
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
+
+    // 新增：/health 自检，便于你在浏览器快速确认工具已注册
+    if (url.pathname === "/health") {
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          tools: ["add","calculate","airtable-list","airtable-get","airtable-create","airtable-update"],
+        }),
+        { headers: { "content-type": "application/json" } }
+      );
+    }
+
+    if (url.pathname === "/sse" || url.pathname === "/sse/message") {
+      return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
+    }
+
+    if (url.pathname === "/mcp") {
+      return MyMCP.serve("/mcp").fetch(request, env, ctx);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
