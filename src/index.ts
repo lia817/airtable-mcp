@@ -1,245 +1,123 @@
+// src/index.ts — Dynamic Airtable tables + health check + SSE/HTTP endpoints
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-// Define our MCP agent with tools
-export class MyMCP extends McpAgent {
-	server = new McpServer({
-		name: "Authless Calculator",
-		version: "1.0.0",
-	});
-
-	async init() {
-		// Simple addition tool
-		this.server.tool("add", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
-			content: [{ type: "text", text: String(a + b) }],
-		}));
-
-		// Calculator tool with multiple operations
-		this.server.tool(
-			"calculate",
-			{
-				operation: z.enum(["add", "subtract", "multiply", "divide"]),
-				a: z.number(),
-				b: z.number(),
-			},
-			async ({ operation, a, b }) => {
-				let result: number;
-				switch (operation) {
-					case "add":
-						result = a + b;
-						break;
-					case "subtract":
-						result = a - b;
-						break;
-					case "multiply":
-						result = a * b;
-						break;
-					case "divide":
-						if (b === 0)
-							return {
-								content: [
-									{
-										type: "text",
-										text: "Error: Cannot divide by zero",
-									},
-								],
-							};
-						result = a / b;
-						break;
-				}
-				return { content: [{ type: "text", text: String(result) }] };
-			},
-		);
-	}
+// ---------- Airtable helpers ----------
+function must(name: string, v?: string) {
+  if (!v) throw new Error(`Missing required env: ${name}`);
+  return v;
 }
 
-export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		const url = new URL(request.url);
+const getEnv = () => ({
+  AIRTABLE_API_KEY: must("AIRTABLE_API_KEY", (globalThis as any).AIRTABLE_API_KEY ?? process.env?.AIRTABLE_API_KEY),
+  AIRTABLE_BASE_ID: must("AIRTABLE_BASE_ID", (globalThis as any).AIRTABLE_BASE_ID ?? process.env?.AIRTABLE_BASE_ID),
+  DEFAULT_TABLE: (globalThis as any).DEFAULT_TABLE ?? process.env?.DEFAULT_TABLE,
+});
 
-		if (url.pathname === "/sse" || url.pathname === "/sse/message") {
-			return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
-		}
+const encode = (s: string) => encodeURIComponent(s);
 
-		if (url.pathname === "/mcp") {
-			return MyMCP.serve("/mcp").fetch(request, env, ctx);
-		}
-
-		return new Response("Not found", { status: 404 });
-	},
-};
-// 在现有 import 下面保留 zod 引入
-import { z } from "zod";
-
-// ……保留你现有的 MyMCP 类，只改 init() 内容：在现有 add/calculate 之后追加 ——>
-
-async init() {
-  // 已有 calculator 工具（保留）
-  this.server.tool("add", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
-    content: [{ type: "text", text: String(a + b) }],
-  }));
-
-  this.server.tool(
-    "calculate",
-    { operation: z.enum(["add","subtract","multiply","divide"]), a: z.number(), b: z.number() },
-    async ({ operation, a, b }) => {
-      let r = 0; if (operation === "add") r=a+b; else if (operation==="subtract") r=a-b;
-      else if (operation==="multiply") r=a*b; else if (operation==="divide") {
-        if (b===0) return { content:[{type:"text", text:"Error: Cannot divide by zero"}] };
-        r=a/b;
-      }
-      return { content: [{ type: "text", text: String(r) }] };
-    }
-  );
-
-  // === 下面开始新增 Airtable 工具 ===
-  const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN!;
-  const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID!;
-  const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE!;
-
-  const at = async (path: string, init?: RequestInit) =>
-    fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${path}`, {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-        "Content-Type": "application/json",
-        ...(init?.headers || {}),
-      },
-    });
-
-  // airtable-list
-  this.server.tool(
-    "airtable-list",
-    { maxRecords: z.number().optional(), view: z.string().optional() },
-    async ({ maxRecords = 5, view }) => {
-      const qs = new URLSearchParams();
-      qs.set("maxRecords", String(maxRecords));
-      if (view) qs.set("view", view);
-      const r = await at(`${encodeURIComponent(AIRTABLE_TABLE)}?${qs.toString()}`);
-      return { content: [{ type: "json", json: await r.json() }] };
-    }
-  );
-
-  // airtable-get
-  this.server.tool(
-    "airtable-get",
-    { id: z.string() },
-    async ({ id }) => {
-      const r = await at(`${encodeURIComponent(AIRTABLE_TABLE)}/${id}`);
-      return { content: [{ type: "json", json: await r.json() }] };
-    }
-  );
-
-  // airtable-create
-  this.server.tool(
-    "airtable-create",
-    { fields: z.record(z.any()) },
-    async ({ fields }) => {
-      const r = await at(`${encodeURIComponent(AIRTABLE_TABLE)}`, {
-        method: "POST",
-        body: JSON.stringify({ fields }),
-      });
-      return { content: [{ type: "json", json: await r.json() }] };
-    }
-  );
-
-  // airtable-update
-  this.server.tool(
-    "airtable-update",
-    { id: z.string(), fields: z.record(z.any()) },
-    async ({ id, fields }) => {
-      const r = await at(`${encodeURIComponent(AIRTABLE_TABLE)}/${id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ fields }),
-      });
-      return { content: [{ type: "json", json: await r.json() }] };
-    }
-  );
+async function airtableFetch(path: string, init?: RequestInit) {
+  const { AIRTABLE_API_KEY } = getEnv();
+  return fetch(`https://api.airtable.com/v0/${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_API_KEY}`,
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+  });
 }
-import { McpAgent } from "agents/mcp";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 
-// Define our MCP agent with tools
+// ---------- MCP Durable Object ----------
 export class MyMCP extends McpAgent {
   server = new McpServer({
-    name: "Authless Calculator",
+    name: "Airtable MCP",
     version: "1.0.0",
   });
 
   async init() {
-    // ====== 已有演示工具（保留） ======
+    // Demo tools (保留，方便快速验证)
     this.server.tool("add", { a: z.number(), b: z.number() }, async ({ a, b }) => ({
       content: [{ type: "text", text: String(a + b) }],
     }));
 
     this.server.tool(
       "calculate",
-      {
-        operation: z.enum(["add", "subtract", "multiply", "divide"]),
-        a: z.number(),
-        b: z.number(),
-      },
+      { operation: z.enum(["add", "subtract", "multiply", "divide"]), a: z.number(), b: z.number() },
       async ({ operation, a, b }) => {
-        let result: number;
-        switch (operation) {
-          case "add": result = a + b; break;
-          case "subtract": result = a - b; break;
-          case "multiply": result = a * b; break;
-          case "divide":
-            if (b === 0) return { content: [{ type: "text", text: "Error: Cannot divide by zero" }] };
-            result = a / b; break;
-        }
-        return { content: [{ type: "text", text: String(result) }] };
-      },
+        if (operation === "divide" && b === 0)
+          return { content: [{ type: "text", text: "Error: Cannot divide by zero" }] };
+        const map = { add: a + b, subtract: a - b, multiply: a * b, divide: a / b } as const;
+        return { content: [{ type: "text", text: String(map[operation]) }] };
+      }
     );
 
-    // ====== 新增：Airtable 工具 ======
-    const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY!; // 面板 Secrets 已配置这个名字
-    const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID!; // 需要在面板 Variables 里新增
-    const AIRTABLE_TABLE = process.env.AIRTABLE_TABLE!;     // 需要在面板 Variables 里新增
+    // ===== Airtable: list tables in Base =====
+    this.server.tool("airtable-tables", {}, async () => {
+      const { AIRTABLE_BASE_ID } = getEnv();
+      const r = await airtableFetch(`meta/bases/${AIRTABLE_BASE_ID}/tables`);
+      return { content: [{ type: "json", json: await r.json() }] };
+    });
 
-    const airtableFetch = async (path: string, init?: RequestInit) => {
-      return fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${path}`, {
-        ...init,
-        headers: {
-          Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-          "Content-Type": "application/json",
-          ...(init?.headers || {}),
-        },
-      });
-    };
-
-    // list
+    // ===== Airtable: list records =====
     this.server.tool(
       "airtable-list",
-      { maxRecords: z.number().optional(), view: z.string().optional() },
-      async ({ maxRecords = 5, view }) => {
+      {
+        table: z.string().optional(), // 不传则走 DEFAULT_TABLE
+        maxRecords: z.number().optional(),
+        pageSize: z.number().min(1).max(100).optional(),
+        view: z.string().optional(),
+        filterByFormula: z.string().optional(),
+        fields: z.array(z.string()).optional(),
+        sort: z
+          .array(z.object({ field: z.string(), direction: z.enum(["asc", "desc"]).optional() }))
+          .optional(),
+      },
+      async ({ table, maxRecords = 5, pageSize, view, filterByFormula, fields, sort }) => {
+        const { AIRTABLE_BASE_ID, DEFAULT_TABLE } = getEnv();
+        const tbl = table ?? DEFAULT_TABLE;
+        if (!tbl) return { content: [{ type: "text", text: "Error: table is required (no DEFAULT_TABLE set)" }] };
+
         const qs = new URLSearchParams();
         qs.set("maxRecords", String(maxRecords));
+        if (pageSize) qs.set("pageSize", String(pageSize));
         if (view) qs.set("view", view);
-        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}?${qs.toString()}`);
+        if (filterByFormula) qs.set("filterByFormula", filterByFormula);
+        if (fields?.length) fields.forEach((f) => qs.append("fields[]", f));
+        if (sort?.length)
+          sort.forEach((s, i) => {
+            qs.append(`sort[${i}][field]`, s.field);
+            if (s.direction) qs.append(`sort[${i}][direction]`, s.direction);
+          });
+
+        const r = await airtableFetch(`${AIRTABLE_BASE_ID}/${encode(tbl)}?${qs.toString()}`);
         return { content: [{ type: "json", json: await r.json() }] };
       }
     );
 
-    // get
+    // ===== Airtable: get one record =====
     this.server.tool(
       "airtable-get",
-      { id: z.string() },
-      async ({ id }) => {
-        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}/${id}`);
+      { table: z.string().optional(), id: z.string() },
+      async ({ table, id }) => {
+        const { AIRTABLE_BASE_ID, DEFAULT_TABLE } = getEnv();
+        const tbl = table ?? DEFAULT_TABLE;
+        if (!tbl) return { content: [{ type: "text", text: "Error: table is required" }] };
+        const r = await airtableFetch(`${AIRTABLE_BASE_ID}/${encode(tbl)}/${id}`);
         return { content: [{ type: "json", json: await r.json() }] };
       }
     );
 
-    // create
+    // ===== Airtable: create record =====
     this.server.tool(
       "airtable-create",
-      { fields: z.record(z.any()) },
-      async ({ fields }) => {
-        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}`, {
+      { table: z.string().optional(), fields: z.record(z.any()) },
+      async ({ table, fields }) => {
+        const { AIRTABLE_BASE_ID, DEFAULT_TABLE } = getEnv();
+        const tbl = table ?? DEFAULT_TABLE;
+        if (!tbl) return { content: [{ type: "text", text: "Error: table is required" }] };
+        const r = await airtableFetch(`${AIRTABLE_BASE_ID}/${encode(tbl)}`, {
           method: "POST",
           body: JSON.stringify({ fields }),
         });
@@ -247,12 +125,15 @@ export class MyMCP extends McpAgent {
       }
     );
 
-    // update
+    // ===== Airtable: update record =====
     this.server.tool(
       "airtable-update",
-      { id: z.string(), fields: z.record(z.any()) },
-      async ({ id, fields }) => {
-        const r = await airtableFetch(`${encodeURIComponent(AIRTABLE_TABLE)}/${id}`, {
+      { table: z.string().optional(), id: z.string(), fields: z.record(z.any()) },
+      async ({ table, id, fields }) => {
+        const { AIRTABLE_BASE_ID, DEFAULT_TABLE } = getEnv();
+        const tbl = table ?? DEFAULT_TABLE;
+        if (!tbl) return { content: [{ type: "text", text: "Error: table is required" }] };
+        const r = await airtableFetch(`${AIRTABLE_BASE_ID}/${encode(tbl)}/${id}`, {
           method: "PATCH",
           body: JSON.stringify({ fields }),
         });
@@ -262,25 +143,41 @@ export class MyMCP extends McpAgent {
   }
 }
 
+// ---------- Worker entry (routes: /health, /sse, /mcp) ----------
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  fetch(request: Request, env: any, ctx: ExecutionContext) {
+    // 把 env 暴露到 global（用于 DO 内读取）
+    (globalThis as any).AIRTABLE_API_KEY = env?.AIRTABLE_API_KEY ?? (globalThis as any).AIRTABLE_API_KEY;
+    (globalThis as any).AIRTABLE_BASE_ID = env?.AIRTABLE_BASE_ID ?? (globalThis as any).AIRTABLE_BASE_ID;
+    (globalThis as any).DEFAULT_TABLE = env?.DEFAULT_TABLE ?? (globalThis as any).DEFAULT_TABLE;
+
     const url = new URL(request.url);
 
-    // 新增：/health 自检，便于你在浏览器快速确认工具已注册
+    // 健康检查：方便浏览器直接验证已注册的工具
     if (url.pathname === "/health") {
       return new Response(
         JSON.stringify({
           ok: true,
-          tools: ["add","calculate","airtable-list","airtable-get","airtable-create","airtable-update"],
+          tools: [
+            "add",
+            "calculate",
+            "airtable-tables",
+            "airtable-list",
+            "airtable-get",
+            "airtable-create",
+            "airtable-update",
+          ],
         }),
         { headers: { "content-type": "application/json" } }
       );
     }
 
+    // SSE for MCP
     if (url.pathname === "/sse" || url.pathname === "/sse/message") {
       return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
     }
 
+    // Streamable HTTP for MCP
     if (url.pathname === "/mcp") {
       return MyMCP.serve("/mcp").fetch(request, env, ctx);
     }
